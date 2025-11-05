@@ -9,7 +9,7 @@ export DJANGO_SETTINGS_MODULE="label_studio.core.settings.label_studio"
 export LABEL_STUDIO_DATA_DIR="${LABEL_STUDIO_DATA_DIR:-/opt/render/.local/share/label-studio}"
 mkdir -p "$LABEL_STUDIO_DATA_DIR"
 
-# 管理员（可在 Render 的 Environment 覆盖）
+# 可在 Render 的 Environment 覆盖
 export LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK="${LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK:-true}"
 export LABEL_STUDIO_USERNAME="${LABEL_STUDIO_USERNAME:-admin@example.com}"
 export LABEL_STUDIO_PASSWORD="${LABEL_STUDIO_PASSWORD:-admin123}"
@@ -22,36 +22,31 @@ PY
 )"
 fi
 
-# -------- 仅修补 import；回修被误改的模型字符串 --------
-python - <<'PY'
-import inspect, pathlib, re, sys
+echo "==> Patching imports & settings (safe mode)..."
 
-try:
-    import label_studio
-except Exception:
-    sys.exit(0)
+python - <<'PY'
+import inspect, pathlib, re
+import label_studio
 
 root = pathlib.Path(inspect.getfile(label_studio)).parent
 
-# 需要处理的内部 app
+# 只修补这些内部 app 的 import；不修改模型字符串引用
 apps = [
     'core','users','tasks','projects','data_manager','organizations',
     'webhooks','data_export','data_import','ml','ml_models',
-    'ml_model_providers',
     'io_storages','labels_manager'
 ]
 
-# 1) 只修补 import 语句（from/import），不动普通字符串
+# 1) 仅修补 import 语句（from/import），不动普通字符串
 import_rules = []
 for app in apps:
     import_rules += [
-        (re.compile(rf'\bfrom\s+{app}\.'),   f'from label_studio.{app}.'),
-        (re.compile(rf'\bimport\s+{app}\.'), f'import label_studio.{app}.'),
-        (re.compile(rf'\bfrom\s+{app}\s+import\b'), f'from label_studio.{app} import'),
+        (re.compile(r'(\bfrom\s+)'+re.escape(app)+r'(\.)'), r'\1label_studio.'+app+r'\2'),
+        (re.compile(r'(\bimport\s+)'+re.escape(app)+r'(\.)'), r'\1label_studio.'+app+r'\2'),
+        (re.compile(r'(\bfrom\s+)'+re.escape(app)+r'(\s+import\b)'), r'\1label_studio.'+app+r'\2'),
     ]
 
-patched = 0
-for p in root.rglob('*.py'):
+def patch_imports(p: pathlib.Path):
     txt = p.read_text(encoding='utf-8', errors='ignore')
     new = txt
     for pat, repl in import_rules:
@@ -59,79 +54,65 @@ for p in root.rglob('*.py'):
     if new != txt:
         p.write_text(new, encoding='utf-8')
         print(f"Patched imports in {p}")
-        patched += 1
 
-# 2) 只在 settings 文件中修补 INSTALLED_APPS 的裸模块名
-def patch_settings_file(path: pathlib.Path):
-    if not path.exists(): 
+for p in root.rglob('*.py'):
+    patch_imports(p)
+
+# 2) 只在 settings 文件中修补 INSTALLED_APPS 的裸模块名，以及 REST Framework 的权限字符串
+def patch_settings(fpath: pathlib.Path):
+    if not fpath.exists():
         return
-    s = path.read_text(encoding='utf-8')
-    s2 = s
+    s = fpath.read_text(encoding='utf-8')
+    orig = s
+    # INSTALLED_APPS: 将 'core' 等裸名字替换为 'label_studio.core'
+    # 仅替换被引号包裹的独立项，避免误伤 'users.User' 这类模型字符串
     for app in apps:
-        # 将 'core' -> 'label_studio.core'（仅限 settings 文件）
-        s2 = s2.replace(f"'{app}'", f"'label_studio.{app}'")
-        s2 = s2.replace(f"\"{app}\"", f"\"label_studio.{app}\"")
-        s2 = s2.replace(f"'{app}.", f"'label_studio.{app}.")
-        s2 = s2.replace(f"\"{app}.", f"\"label_studio.{app}.")
-    # 特例：基础设置导入
-    s2 = s2.replace('from core.settings.base', 'from label_studio.core.settings.base')
-    if s2 != s:
-        path.write_text(s2, encoding='utf-8')
-        print(f"Patched settings in {path}")
+        s = re.sub(rf"(?P<q>['\"])({app})(?P=q)", rf"\g<q>label_studio.{app}\g<q>", s)
+    # REST_FRAMEWORK 里的字符串路径
+    s = s.replace("core.api_permissions.HasObjectPermission",
+                  "label_studio.core.api_permissions.HasObjectPermission")
+    if s != orig:
+        fpath.write_text(s, encoding='utf-8')
+        print(f"Patched settings in {fpath}")
 
-patch_settings_file(root / 'core' / 'settings' / 'label_studio.py')
-patch_settings_file(root / 'core' / 'settings' / 'base.py')
+patch_settings(root / 'core' / 'settings' / 'label_studio.py')
+patch_settings(root / 'core' / 'settings' / 'base.py')
 
-# 3) 回修“被误改”的模型字符串：'label_studio.<app>.<Model>' -> '<app>.<Model>'
-app_alt = '(?:' + '|'.join(map(re.escape, apps)) + ')'
-model_ref_pat = re.compile(r'([\'\"])label_studio\.' + app_alt + r'\.([A-Z][A-Za-z0-9_]+)([\'\"])')
-
-for p in root.rglob('*.py'):
-    txt = p.read_text(encoding='utf-8', errors='ignore')
-    def _fix(m):
-        full = m.group(0)
-        quote1, app, model, quote2 = m.group(1), None, None, m.group(3)
-        # 重新解析以拿到 app 名
-    PY
-python - <<'PY'
-import inspect, pathlib, re, sys
-import label_studio
-
-root = pathlib.Path(inspect.getfile(label_studio)).parent
-apps = [
-    'core','users','tasks','projects','data_manager','organizations',
-    'webhooks','data_export','data_import','ml','ml_models',
-    'ml_model_providers',
-    'io_storages','labels_manager'
-]
-app_alt = '(?:' + '|'.join(map(re.escape, apps)) + ')'
-model_ref_pat = re.compile(r'([\'\"])label_studio\.(' + app_alt + r')\.([A-Z][A-Za-z0-9_]+)([\'\"])')
-
-for p in root.rglob('*.py'):
+# 3) 回修“被误改”的模型字符串（若之前误改过）
+#    'label_studio.users.User' -> 'users.User'（Django 要求 'app_label.ModelName'）
+model_ref_pat = re.compile(r"([\"'])label_studio\.(\w+)\.([A-Z][A-Za-z0-9_]+)([\"'])")
+def revert_model_refs(p: pathlib.Path):
     txt = p.read_text(encoding='utf-8', errors='ignore')
     new = model_ref_pat.sub(lambda m: f"{m.group(1)}{m.group(2)}.{m.group(3)}{m.group(4)}", txt)
     if new != txt:
         p.write_text(new, encoding='utf-8')
         print(f"Repaired model refs in {p}")
+
+for p in root.rglob('*.py'):
+    revert_model_refs(p)
 PY
-# -------- 迁移数据库（幂等）--------
+
+echo "==> Running migrations..."
 python -m label_studio.manage migrate --noinput || true
 
-# -------- 确保管理员账号存在 --------
+echo "==> Ensuring admin user..."
 python - <<'PY'
 import os, django
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "label_studio.core.settings.label_studio")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE","label_studio.core.settings.label_studio")
 django.setup()
-from users.models import User  # 注意：这里用 app_label 导入，以适配 AUTH_USER_MODEL = 'users.User'
+from django.contrib.auth import get_user_model
+User = get_user_model()
 email = os.environ.get("LABEL_STUDIO_USERNAME","admin@example.com")
-pwd = os.environ.get("LABEL_STUDIO_PASSWORD","admin123")
+pwd   = os.environ.get("LABEL_STUDIO_PASSWORD","admin123")
 u, created = User.objects.get_or_create(email=email, defaults={"is_superuser": True, "is_staff": True})
-u.is_superuser = True; u.is_staff = True
-u.set_password(pwd); u.save()
+u.is_superuser = True
+u.is_staff = True
+u.set_password(pwd)
+u.save()
 print("Admin ready:", email, "(created)" if created else "(updated)")
 PY
 
-# -------- 启动 Gunicorn --------
+echo "==> Starting gunicorn on port ${PORT} ..."
 exec gunicorn label_studio.core.wsgi:application \
   --bind 0.0.0.0:${PORT} \
   --workers ${GUNICORN_WORKERS:-2} \

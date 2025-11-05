@@ -26,18 +26,19 @@ echo "==> Patching imports & settings (safe mode)..."
 
 python - <<'PY'
 import inspect, pathlib, re
+import importlib
 import label_studio
 
 root = pathlib.Path(inspect.getfile(label_studio)).parent
 
-# 只修补这些内部 app 的 import；不修改模型字符串引用
+# 需要处理的内部 app
 apps = [
     'core','users','tasks','projects','data_manager','organizations',
     'webhooks','data_export','data_import','ml','ml_models',
     'io_storages','labels_manager'
 ]
 
-# 1) 仅修补 import 语句（from/import），不动普通字符串
+# ---------- 1) 修补 import 路径（仅修补 import 语句） ----------
 import_rules = []
 for app in apps:
     import_rules += [
@@ -58,19 +59,22 @@ def patch_imports(p: pathlib.Path):
 for p in root.rglob('*.py'):
     patch_imports(p)
 
-# 2) 只在 settings 文件中修补 INSTALLED_APPS 的裸模块名，以及 REST Framework 的权限字符串
+# ---------- 2) 修补 settings：INSTALLED_APPS/权限字符串/移除无效 app ----------
 def patch_settings(fpath: pathlib.Path):
     if not fpath.exists():
         return
     s = fpath.read_text(encoding='utf-8')
     orig = s
-    # INSTALLED_APPS: 将 'core' 等裸名字替换为 'label_studio.core'
-    # 仅替换被引号包裹的独立项，避免误伤 'users.User' 这类模型字符串
+    # 将 'core' 等裸名字替换为 'label_studio.core'（仅限引号包裹的独立项）
     for app in apps:
         s = re.sub(rf"(?P<q>['\"])({app})(?P=q)", rf"\g<q>label_studio.{app}\g<q>", s)
-    # REST_FRAMEWORK 里的字符串路径
+        s = re.sub(rf"(?P<q>['\"])({app}\.apps\.[A-Za-z0-9_]+Config)(?P=q)",
+                   rf"\g<q>label_studio.{app}.apps.\2\g<q>", s)
+    # REST_FRAMEWORK 权限路径
     s = s.replace("core.api_permissions.HasObjectPermission",
                   "label_studio.core.api_permissions.HasObjectPermission")
+    # 移除可能不存在的 ml_model_providers
+    s = re.sub(r"[\"']ml_model_providers[\"'],?\s*", "", s)
     if s != orig:
         fpath.write_text(s, encoding='utf-8')
         print(f"Patched settings in {fpath}")
@@ -78,8 +82,7 @@ def patch_settings(fpath: pathlib.Path):
 patch_settings(root / 'core' / 'settings' / 'label_studio.py')
 patch_settings(root / 'core' / 'settings' / 'base.py')
 
-# 3) 回修“被误改”的模型字符串（若之前误改过）
-#    'label_studio.users.User' -> 'users.User'（Django 要求 'app_label.ModelName'）
+# ---------- 3) 回修模型字符串（避免出现 'label_studio.users.User'） ----------
 model_ref_pat = re.compile(r"([\"'])label_studio\.(\w+)\.([A-Z][A-Za-z0-9_]+)([\"'])")
 def revert_model_refs(p: pathlib.Path):
     txt = p.read_text(encoding='utf-8', errors='ignore')
@@ -90,6 +93,43 @@ def revert_model_refs(p: pathlib.Path):
 
 for p in root.rglob('*.py'):
     revert_model_refs(p)
+
+# ---------- 4) 修补 AppConfig.name 与 default_app_config ----------
+appconfig_pat = re.compile(r'^\s*class\s+([A-Za-z0-9_]+)\(.*AppConfig.*\):', re.M)
+name_pat = re.compile(r'^\s*name\s*=\s*[\'"]([^\'"]+)[\'"]\s*$', re.M)
+
+def fix_app_config(app: str):
+    apps_py = root / app / 'apps.py'
+    if apps_py.exists():
+        s = apps_py.read_text(encoding='utf-8')
+        # 找到 AppConfig 子类
+        m = appconfig_pat.search(s)
+        if m:
+            cfg_cls = m.group(1)
+            # 修正 name='label_studio.<app>'
+            if name_pat.search(s):
+                s2 = name_pat.sub(f"name = 'label_studio.{app}'", s)
+            else:
+                # 没有 name 字段就补上
+                s2 = s.replace(m.group(0), m.group(0) + f"\n    name = 'label_studio.{app}'\n")
+            if s2 != s:
+                apps_py.write_text(s2, encoding='utf-8')
+                print(f"Patched AppConfig.name in {apps_py}")
+            # 同步 default_app_config
+            init_py = root / app / '__init__.py'
+            if init_py.exists():
+                t = init_py.read_text(encoding='utf-8')
+                t2 = re.sub(
+                    r"^\s*default_app_config\s*=\s*[\'\"][^\'\"]+[\'\"]\s*$",
+                    f"default_app_config = 'label_studio.{app}.apps.{cfg_cls}'",
+                    t, flags=re.M
+                )
+                if t2 != t:
+                    init_py.write_text(t2, encoding='utf-8')
+                    print(f"Patched default_app_config in {init_py}")
+
+for app in apps:
+    fix_app_config(app)
 PY
 
 echo "==> Running migrations..."

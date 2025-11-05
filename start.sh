@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # 确保运行时具备 pkg_resources 等
-python -m pip install -q --upgrade pip setuptools wheel
+python -m pip install -q --upgrade pip setuptools
 
 # Render 注入的端口；本地兜底 8080
 PORT="${PORT:-8080}"

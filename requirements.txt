@@ -1,0 +1,5 @@
+# Pinned to a stable Label Studio; adjust if you need newer features
+label-studio==1.14.0
+# Optional: add a production server or DB driver if needed
+# gunicorn
+# psycopg2-binary
